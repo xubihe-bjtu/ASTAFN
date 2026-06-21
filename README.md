@@ -29,8 +29,8 @@ You can obtain the three well-preprocessed datasets—`California`, `GUANGDONG`,
 ~~~
 dataset/
  ├── California/
- ├── Guangdong/
- ├── Yunnan/
+ ├── GUANGDONG/
+ ├── YUNNAN/
 ~~~
 
 The datasets used in this work are **exactly consistent with the final version reported in the paper**.  All spatial resolutions, station counts, and grid alignments strictly correspond to the descriptions in the paper. The detailed dataset configuration is summarized as follows:
@@ -54,8 +54,8 @@ You can download the pretrained model checkpoint (.pth) from the following [Goog
 ~~~
 save/
  ├── California/
- ├── Guangdong/
- ├── Yunnan/
+ ├── GUANGDONG/
+ ├── YUNNAN/
 ~~~
 
 The model takes the past **8 time steps** (1 day) as input and predicts **the next 8 steps** (24 hours) at 3-hour intervals.

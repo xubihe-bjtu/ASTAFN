@@ -83,7 +83,7 @@ bash experiments/California/train_v.sh
 ~~~
 
 The corresponding station-level forecasting results will be saved under the directory `./save/California/ASTAFN/`.
-
+For inference in the Guangdong or Yunnan regions, simply replace `California` with `GuangDong` or `YunNan`.
 P.S. The results in the paper are averaged over multiple runs. We fix the random seed for evaluation, and small deviations from the reported numbers are expected due to stochasticity and do not affect the conclusions. In addition, due to the highly volatile wind speed characteristics in Yunnan, we provide a lightweight region-adapted variant of **ASTAFN**, referred to as **ASTAFN_adap**, with minor implementation-level adjustments while keeping the overall framework unchanged.
 
 # 📖 Citation

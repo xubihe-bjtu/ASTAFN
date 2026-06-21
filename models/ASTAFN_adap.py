@@ -13,169 +13,40 @@ class nconv(nn.Module):
         x = torch.einsum('ncvl,vw->ncwl', (x, A))
         return x.contiguous()
 
-class LearnableFourierEncoding(nn.Module):
-    def __init__(self, device,input_dim=2, num_bands=16, out_dim=64):
-        super().__init__()
-        self.num_bands = num_bands
-        self.input_dim = input_dim
-        self.out_dim = out_dim
-        self.device=device
-
-        # 可学习频率 (num_bands, input_dim)
-        self.freq = nn.Parameter(torch.randn(num_bands, input_dim) * 2 * math.pi).to(self.device)
-        # 可选：可学习相位 (num_bands,)
-        self.phase = nn.Parameter(torch.zeros(num_bands)).to(self.device)
-
-        # 映射到最终维度
-        self.mlp = nn.Sequential(
-            nn.Linear(num_bands * 2, out_dim),
-            nn.ReLU(),
-            nn.Linear(out_dim, out_dim)
-        )
-
-    def forward(self, pos):
-        '''
-        pos: shape (..., input_dim), e.g.
-              csta: (N, 2)
-              cera: (N, k, 2)
-              cpan: (N, k, 2)
-        return: (..., out_dim)
-        '''
-        # flatten for computation
-        orig_shape = pos.shape[:-1]
-        pos_flat = pos.view(-1, self.input_dim)  # (B, 2)
-
-        # (B, num_bands)
-        projection = pos_flat @ self.freq.T + self.phase
-        fourier_features = torch.cat([torch.sin(projection), torch.cos(projection)], dim=-1)  # (B, num_bands*2)
-
-        # pass through MLP
-        encoded = self.mlp(fourier_features)  # (B, out_dim)
-
-        return encoded.view(*orig_shape, -1)  # reshape back
-
-class PerNodeMLPList(nn.Module):
-    def __init__(self, d_align, input_dim, num_nodes):
-        super().__init__()
-        self.num_nodes = num_nodes
-        self.mlps = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv1d(2 * d_align, d_align, kernel_size=1),  # (B, 2D, L) → (B, D, L)
-                nn.ReLU(),
-                nn.Conv1d(d_align, input_dim + 2, kernel_size=1)  # (B, D, L) → (B, C+2, L)
-            ) for _ in range(num_nodes)
-        ])
-
-    def forward(self, x):
-        # x: (B, 2D, N, L)
-        B, _, N, L = x.shape
-        assert N == self.num_nodes, f"Expected {self.num_nodes} nodes, got {N}"
-
-        outputs = []
-        for i in range(N):
-            # 取第 i 个站点的数据: (B, 2D, L)
-            x_i = x[:, :, i, :]  # shape: (B, 2D, L)
-
-            # 输入对应的 MLP
-            out_i = self.mlps[i](x_i)  # shape: (B, C+2, L)
-
-            outputs.append(out_i.unsqueeze(2))  # (B, C+2, 1, L)
-
-        # 拼接所有站点的输出: (B, C+2, N, L)
-        out = torch.cat(outputs, dim=2)
-        return out
-
 class proxy_site_alignment(nn.Module):
     def __init__(self, k,d_align,num_node,seq_len,input_dim,device,init=True):
         super(proxy_site_alignment, self).__init__()
-        self.sta_geoenc=LearnableFourierEncoding(device=device,input_dim=2, num_bands=2, out_dim=2)
-        self.era_geoenc=LearnableFourierEncoding(device=device,input_dim=2, num_bands=2, out_dim=2)
-        self.pan_geoenc = LearnableFourierEncoding(device=device, input_dim=2, num_bands=2, out_dim=2)
-
-        self.k = k
-        self.sta_proj = nn.Conv2d(input_dim + 2, d_align, kernel_size=1)
-        self.q_proj = nn.Conv2d(input_dim+2, d_align, kernel_size=1)
-        self.k_proj = nn.Conv3d(input_dim+2, d_align, kernel_size=1)  # 3D for era_f (C+2, N, k, L)
-        self.v_proj = nn.Conv3d(input_dim + 2, d_align, kernel_size=1)
-        self.net_pan = PerNodeMLPList(d_align=d_align, input_dim=input_dim, num_nodes=num_node)
-
-        self.net_era = PerNodeMLPList(d_align=input_dim + 2 , input_dim=input_dim, num_nodes=num_node)
-
+        self.k=k
+        self.d_align=d_align
+        self.init=init
+        self.seq_len=seq_len
+        self.in_dim=input_dim
+        self.query_layer = nn.Conv2d(in_channels=seq_len,out_channels=d_align,kernel_size=(1, 1))
+        self.key_layer = nn.Conv2d(in_channels=seq_len,out_channels=d_align,kernel_size=(1, 1))
+        self.query_layer_c = nn.Conv2d(in_channels=2, out_channels=d_align, kernel_size=(1, 1))
+        self.key_layer_c = nn.Conv2d(in_channels=2, out_channels=d_align, kernel_size=(1, 1))
         self.device=device
+        self.bias=nn.Parameter(torch.zeros( 1,self.in_dim, num_node, self.k).to(self.device), requires_grad=True).to(self.device)
 
-    def forward(self,obs_his,era_k,pan_k,csta,cera):
+    def forward(self,obs_his,era_k,csta,cera):
         '''
         obs_his:(B,C,N,L)
         era_k:(B,C,N,k,L)
         pan_k:(B,C,N,k,L)
         csta:(N,2)
         cera:(N,k,2)
-        cpan:(N,k,2)
         '''
-        B, C, N, k,L = era_k.shape
-        #可学习傅里叶编码
-        csta,cera=torch.tensor(csta, dtype=torch.float32).to(self.device),torch.tensor(cera, dtype=torch.float32).to(self.device)
-        enc_sta =self.sta_geoenc(csta)  # (N, 64)
-        enc_era = self.era_geoenc(cera)  # (N, k, 64)
-        enc_pan = self.pan_geoenc(cera)  # (N, k, 64)
-        #将编码标准化消除数值尺度影响
-        def normalize_pos(x):
-            # x: (..., 2)
-            return 2 * (x - x.min(dim=-2, keepdim=True)[0]) / (
-                        x.max(dim=-2, keepdim=True)[0] - x.min(dim=-2, keepdim=True)[0] + 1e-6) - 1
-        enc_sta = normalize_pos(enc_sta)
-        enc_era = normalize_pos(enc_era)
-        enc_pan = normalize_pos(enc_pan)
-        #将地理编码与特征拼接起来
-        enc_sta = enc_sta.T[None, :, :, None].expand(B, 2, N, L)
-        enc_era = enc_era.permute(2, 0, 1)[None, :, :, :, None].expand(B, 2, N, k, L)
-        enc_pan = enc_pan.permute(2, 0, 1)[None, :, :, :, None].expand(B, 2, N, k, L)
-        sta_f=torch.cat([obs_his,enc_sta],dim=1)#(B,C+2,N,L)
-        era_f=torch.cat([era_k,enc_era],dim=1)#(B,C+2,N,k,L)
-        pan_f=torch.cat([pan_k,enc_pan],dim=1)#(B,C+2,N,k,L)
-
-        #计算历史观测与历史近邻era5网格的关系
-        sta_enc=self.sta_proj(sta_f)
-        Q = self.q_proj(sta_f)  # (B, d_model, N, L)
-        K = self.k_proj(pan_f)  # (B, d_model, N, k, L)
-        V= self.v_proj(pan_f)
-        Q = Q.permute(0, 2, 3, 1)  # (B, N, L, d_model)
-        K = K.permute(0, 2, 4, 3, 1)  # (B, N, L, k, d_model)
-        attn_score = torch.einsum('bnld,bnlkd->bnlk', Q, K) / (K.shape[-1] ** 0.5)  # (B, N, L, k)
-        attn_score = torch.softmax(attn_score, dim=-1)  # (B, N, L, k)
-        attn_score = attn_score.permute(0, 1, 3, 2)  # (B, N, k, L)
-
-        #加权未来盘古虚拟站点
-        attn_exp = attn_score.unsqueeze(1)  # → (B, 1, N, k, L)
-        # # 举例阈值
-        # threshold = 0.8
-        #
-        # # 找出超过阈值的所有索引
-        # idx = torch.where(attn_exp > threshold)
-        #
-        # # 提取批次、站点、时间窗口的索引
-        # batch_idx = idx[0]
-        # station_idx = idx[2]
-        # k_idx=idx[3]
-        # time_idx = idx[4]
-        #
-        # # 获取对应的 attention 值
-        # values = attn_exp[idx[0],0,idx[2],:,idx[4]]
-        # for i in range(len(values)):
-        #     sample_id = batch_idx[i].item()   # 还原原始样本编号
-        #     station = station_idx[i].item()
-        #     timepos = time_idx[i].item()
-        #     value = values[i]
-        #     print(f"样本 {sample_id:02d} | 站点 {station:03d} | 时间窗位置 {timepos:02d} | attention = {value}")
-        proxy_pan = (attn_exp * V).sum(dim=3)  # → (B, D, N, L)
-        cat_pan = torch.cat([proxy_pan, sta_enc], dim=1)  # → (B, 2D, N, L)
-        tile_P = self.net_pan(cat_pan)  # → (B, C+2, N, L)
-
-        proxy_era = (attn_exp * era_f).sum(dim=3)  # → (B, C+2, N, L)
-        cat_era = torch.cat([proxy_era, sta_f], dim=1)  # → (B, 2C+4, N, L)
-        tile_E = self.net_era(cat_era)  # → (B, C+2, N, L)
-
-        return sta_f,tile_P,tile_E #B,C+2,N,L
+        B, C, N, L = obs_his.shape
+        obs_his=obs_his.permute(0,3,2,1)
+        era_k=era_k.view(B,C,-1,L).permute(0,3,2,1)
+        Q=self.query_layer(obs_his)#B,d_model,N,C
+        K=self.key_layer(era_k)
+        Q=Q.permute(0,3,2,1)#B,C,N,d
+        K=K.permute(0,3,2,1)
+        K=K.reshape(B,C,N,self.k,self.d_align)#B,C,N,k,d
+        attn_scores=torch.einsum('bcnd,bcnkd->bcnk',Q,K)#B,c,N,k
+        attn_scores=F.softmax((attn_scores+self.bias),dim=-1)
+        return attn_scores
 
 class find_k_nearest_neighbors(nn.Module):
     def __init__(self, k,device):
@@ -196,7 +67,6 @@ class find_k_nearest_neighbors(nn.Module):
         era_k=[]
         pan_k=[]
         cera_k=[]
-        cpan_k=[]
         for n in range(N):
             # 获取当前 obs_his 站点的坐标
             station_coord = np.array(cobs[n]).reshape(1,2)  # (2,)
@@ -206,8 +76,6 @@ class find_k_nearest_neighbors(nn.Module):
             _, indices_pan = nbrs_pan.kneighbors(station_coord)
             indices_era=torch.Tensor(indices_era).to(self.device).long()
             indices_pan=torch.Tensor(indices_pan).to(self.device).long()
-
-            # 保证是一维的索引张量
             era_his_n=era_his[:,:,indices_era,:]#era_his:(B,C,1,k,L)
             pan_fut_n=pan_fut[:,:,indices_era,:]#pan_fut:(B,C,1,k,L)
             cera_n=torch.Tensor(cera_flat[indices_era.cpu(),:]).to(self.device)
@@ -215,21 +83,16 @@ class find_k_nearest_neighbors(nn.Module):
             era_k.append(era_his_n)
             pan_k.append(pan_fut_n)
             cera_k.append(cera_n)
-            cpan_k.append(cpan_n)
         era_k=torch.cat(era_k,dim=2)#era_k:(B,C,N,k,L)
         pan_k=torch.cat(pan_k,dim=2)#pan_k:(B,C,N,k,L)
 
         if self.k!=1:
             cera_k=torch.cat(cera_k,dim=0)
-            cpan_k=torch.cat(cpan_k,dim=0)
         else:
             cera_k=torch.cat(cera_k,dim=0)
             cera_k=cera_k.reshape(N,2)
             cera_k=cera_k.unsqueeze(1)
-            cpan_k=torch.cat(cpan_k,dim=0)
-            cpan_k=cpan_k.reshape(N,2)
-            cpan_k=cpan_k.unsqueeze(1)
-        return era_k,pan_k,cera_k,cpan_k
+        return era_k,pan_k,cera_k
 
 class ValueEmbedding(nn.Module):
     def __init__(self, c_in,d_model):
@@ -270,7 +133,7 @@ class PositionalEmbedding(nn.Module):
 class DataEmbedding(nn.Module):
     def __init__(self, c_in, d_model,args, dropout=0.1):
         super(DataEmbedding, self).__init__()
-        self.value_embedding = ValueEmbedding(c_in=c_in,d_model=d_model)
+        self.value_embedding = ValueEmbedding(c_in=args.in_dim,d_model=d_model)
         self.position_embedding = PositionalEmbedding(d_model=d_model)
         self.dropout = nn.Dropout(p=dropout)
 
@@ -379,9 +242,10 @@ class AdaptiveCombiner(nn.Module):
 
         self.relu=nn.ReLU()
 
-    def forward(self,x_emb,y_emb,era_k,obs_his,tilde_E):
+    def forward(self,x_emb,y_emb,era_k,obs_his,attn_scores):
 
         B,_,N,L=obs_his.shape
+        tilde_E=(attn_scores * era_k).sum(dim=3)
 
         tilde_E=tilde_E[:,[self.target],:,:]#B,1,N,L
         obs_his=obs_his[:,[self.target],:,:]#B,1,N,L
@@ -513,7 +377,7 @@ class Model(nn.Module):
         self.in_dim=args.in_dim
         self.d_model=args.d_model
         self.d_align=args.d_align
-        self.dropout=args.dropout
+        self.dropout=0.2
         self.batch_size=args.batch_size
         self.num_nodes=args.num_nodes
         self.device=args.device
@@ -525,16 +389,16 @@ class Model(nn.Module):
         self.target=args.target
         self.d_node=10
 
-        self.nodevecgenerate1 = NodeEmbeddingGenerator(self.in_dim+2, self.d_node, self.num_nodes)
-        self.nodevecgenerate2 = NodeEmbeddingGenerator(self.in_dim+2, self.d_node, self.num_nodes)
-        self.nodevecgenerate3 = NodeEmbeddingGenerator(self.in_dim+2, self.d_node, self.num_nodes)
-        self.nodevecgenerate4 = NodeEmbeddingGenerator(self.in_dim+2, self.d_node, self.num_nodes)
+        self.nodevecgenerate1 = NodeEmbeddingGenerator(self.in_dim, self.d_node, self.num_nodes)
+        self.nodevecgenerate2 = NodeEmbeddingGenerator(self.in_dim, self.d_node, self.num_nodes)
+        self.nodevecgenerate3 = NodeEmbeddingGenerator(self.in_dim, self.d_node, self.num_nodes)
+        self.nodevecgenerate4 = NodeEmbeddingGenerator(self.in_dim, self.d_node, self.num_nodes)
 
         self.proxy_site_alignment=proxy_site_alignment(self.k,self.d_align,self.num_nodes,self.seq_len,self.in_dim,self.device)
         self.find_k_nearest_neighbors=find_k_nearest_neighbors(self.k,self.device)
         self.find_nearest_neighbors = find_k_nearest_neighbors(1, self.device)
-        self.his_data_embedding = DataEmbedding(self.in_dim+2, self.d_model, args, self.dropout)
-        self.fut_data_embedding = DataEmbedding(self.in_dim+2, self.d_model, args, self.dropout)
+        self.his_data_embedding = DataEmbedding(self.in_dim, self.d_model, args, self.dropout)
+        self.fut_data_embedding = DataEmbedding(self.in_dim, self.d_model, args, self.dropout)
         self.his_tcn = TCN(self.d_model, self.d_model, self.num_layers, kernel_size=3, max_dilation=16)
         self.fut_tcn = TCN(self.d_model, self.d_model, self.num_layers, kernel_size=3, max_dilation=16)
         self.his_gcn = HierarchicalGCN(self.seq_len, self.output_len, self.dropout, support_len=3)
@@ -557,9 +421,13 @@ class Model(nn.Module):
               cpan:(lat,lon,2)
         '''
 
-        era_k,pan_k,cera_k,cpan_k=self.find_k_nearest_neighbors(obs_his, era_his, pan_fut, csta, cera, cpan)
+        era_k,pan_k,cera_k=self.find_k_nearest_neighbors(obs_his, era_his, pan_fut, csta, cera, cpan)
 
-        obs_his,tilde_P,tilde_E=self.proxy_site_alignment(obs_his,era_k,pan_k,csta,cera_k)
+        attn_scores=self.proxy_site_alignment(obs_his,era_k,csta,cera_k)
+
+        attn_scores_expanded = attn_scores.unsqueeze(-1)  # (B, C, N, k, 1)
+
+        tilde_P = (attn_scores_expanded * pan_k).sum(dim=3)  # (B, C, N, L)
 
         x_emb = self.his_data_embedding(obs_his)
         y_emb = self.fut_data_embedding(tilde_P)
@@ -589,8 +457,7 @@ class Model(nn.Module):
         fuse_h = xtime_emb+spatio_attn_h.permute(0,3,2,1)
         fuse_f=ytime_emb+spatio_attn_f.permute(0,3,2,1)
 
-        W = self.adaptivefusion(fuse_h, fuse_f, era_k, obs_his, tilde_E)#B,D,N,L
-
+        W = self.adaptivefusion(fuse_h, fuse_f, era_k, obs_his, attn_scores_expanded)
         output = self.predict_layer(fuse_h + W * fuse_f)
 
         return output

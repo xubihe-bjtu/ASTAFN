@@ -1,11 +1,11 @@
 import torch.optim as optim
 from script.metric import *
-from models import ASTAFN, HimNet,DUQ,HimNet_S,MegaCRN_S,MegaCRN,MPNN
+from models import ASTAFN, ASTAFN_adap,HimNet,DUQ,HimNet_S,MegaCRN_S,MegaCRN,MPNN
 
 
 class Trainer():
     def __init__(self,args,predefined_A,target_scaler):
-        self.model_dict={'ASTAFN':ASTAFN,'DUQ':DUQ,'HimNet':HimNet,'HimNet_S':HimNet_S,'MegaCRN_S':MegaCRN_S,'MPNN':MPNN,'MegaCRN':MegaCRN}
+        self.model_dict={'ASTAFN':ASTAFN,'ASTAFN_adap':ASTAFN_adap,'DUQ':DUQ,'HimNet':HimNet,'HimNet_S':HimNet_S,'MegaCRN_S':MegaCRN_S,'MPNN':MPNN,'MegaCRN':MegaCRN}
         self.model=self._build_model(args,predefined_A).to(args.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         self.loss = masked_mae
